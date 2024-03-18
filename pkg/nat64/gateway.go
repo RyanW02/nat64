@@ -1,6 +1,8 @@
 package nat64
 
 import (
+	"fmt"
+	"github.com/google/gopacket/layers"
 	"github.com/songgao/water"
 	"go.uber.org/zap"
 	"net"
@@ -8,8 +10,9 @@ import (
 )
 
 type Gateway struct {
-	options       Options
-	logger        *zap.Logger
+	options Options
+	logger  *zap.Logger
+
 	outboundHooks map[uint8][]OutboundHook
 	inboundHooks  map[uint8][]InboundHook
 
@@ -25,14 +28,24 @@ type Options struct {
 	NAT6Prefix       *net.IPNet
 }
 
+type OutboundHook func(header *layers.IPv4, data []byte) ([]byte, bool)
+type InboundHook func(header *layers.IPv6, data []byte) ([]byte, bool)
+
 func NewGateway(options Options, logger *zap.Logger) *Gateway {
 	return &Gateway{
 		options: options,
 		logger:  logger,
+
+		outboundHooks: make(map[uint8][]OutboundHook),
+		inboundHooks:  make(map[uint8][]InboundHook),
 	}
 }
 
 func (g *Gateway) Configure() error {
+	if _, err := net.InterfaceByName(g.options.WANInterfaceName); err != nil {
+		return fmt.Errorf("error getting WAN interface \"%s\" - does it exist? %w", g.options.WANInterfaceName, err)
+	}
+
 	iface, err := g.createTUN()
 	if err != nil {
 		return err
@@ -92,6 +105,9 @@ func (g *Gateway) RegisterInboundHook(protocol uint8, hook InboundHook) {
 }
 
 func (g *Gateway) Run() chan error {
+	g.RegisterOutboundHook(uint8(layers.IPProtocolICMPv6), g.ICMPv6Converter)
+	g.RegisterInboundHook(uint8(layers.IPProtocolICMPv4), g.ICMPv4Converter)
+
 	shutdownCh := make(chan error)
 
 	go func(shutdownCh chan error) {
@@ -118,8 +134,10 @@ func (g *Gateway) Run() chan error {
 			ipVersion := bytes[0] >> 4
 			if ipVersion == 6 {
 				g.handleOutboundPacket(bytes[:n])
-			} else {
+			} else if ipVersion == 4 {
 				g.handleInboundPacket(bytes[:n])
+			} else {
+				g.logger.Warn("Unknown IP version", zap.Uint8("version", ipVersion))
 			}
 		}
 	}(shutdownCh)
@@ -148,10 +166,7 @@ func (g *Gateway) createTUN() (*water.Interface, error) {
 func (g *Gateway) nat6Address() net.IP {
 	addr := make(net.IP, 16)
 	copy(addr, g.options.NAT6Prefix.IP)
+	copy(addr[12:], g.options.NAT4Address)
 
-	addr[12] = g.options.NAT4Address[0]
-	addr[13] = g.options.NAT4Address[1]
-	addr[14] = g.options.NAT4Address[2]
-	addr[15] = g.options.NAT4Address[3]
 	return addr
 }

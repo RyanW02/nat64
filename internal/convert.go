@@ -14,10 +14,7 @@ func IPv4ToNAT64(ip net.IP) net.IP {
 	natIp[1] = 0x64
 	natIp[2] = 0xff
 	natIp[3] = 0x9b
+	copy(natIp[12:], ip)
 
-	natIp[12] = ip[0]
-	natIp[13] = ip[1]
-	natIp[14] = ip[2]
-	natIp[15] = ip[3]
 	return natIp
 }

@@ -9,8 +9,6 @@ import (
 	"net"
 )
 
-type InboundHook func(header *layers.IPv6, data []byte)
-
 func (g *Gateway) handleInboundPacket(bytes []byte) {
 	logger := g.logger.With(zap.String("flow", "inbound"))
 
@@ -19,34 +17,25 @@ func (g *Gateway) handleInboundPacket(bytes []byte) {
 		return
 	}
 
-	v4Header, err := ipv4.ParseHeader(bytes)
-	if err != nil {
-		logger.Error("Error parsing IPv4 header", zap.Error(err), zap.Any("bytes", bytes))
+	packet := gopacket.NewPacket(bytes, layers.LayerTypeIPv4, gopacket.Default)
+
+	if packet.NetworkLayer() == nil || packet.NetworkLayer().LayerType() != layers.LayerTypeIPv4 {
+		logger.Warn("Packet does not contain an IPv4 layer")
 		return
 	}
 
-	data := bytes[ipv4.HeaderLen:]
+	v4Header := packet.NetworkLayer().(*layers.IPv4)
+	data := v4Header.LayerPayload()
 
-	v6Src := internal.IPv4ToNAT64(v4Header.Src)
+	if v4Header.SrcIP.IsPrivate() {
+		return
+	}
+
+	v6Src := internal.IPv4ToNAT64(v4Header.SrcIP)
 
 	v6Dst := make(net.IP, 16)
 	copy(v6Dst, g.options.NAT6Prefix.IP)
-
-	v4Dst := v4Header.Dst.To4()
-	v6Dst[12] = v4Dst[0]
-	v6Dst[13] = v4Dst[1]
-	v6Dst[14] = v4Dst[2]
-	v6Dst[15] = v4Dst[3]
-
-	var hopLimit uint8 = 255
-	if v4Header.TTL >= 0 && v4Header.TTL <= 255 {
-		hopLimit = uint8(v4Header.TTL)
-	}
-
-	if v4Header.Protocol < 0 || v4Header.Protocol > 255 {
-		logger.Warn("Invalid protocol", zap.Int("protocol", v4Header.Protocol))
-		return
-	}
+	copy(v6Dst[12:], v4Header.DstIP.To4())
 
 	v6Header := &layers.IPv6{
 		BaseLayer: layers.BaseLayer{
@@ -54,11 +43,11 @@ func (g *Gateway) handleInboundPacket(bytes []byte) {
 			Payload:  data,
 		},
 		Version:      6,
-		TrafficClass: 0,
+		TrafficClass: v4Header.TOS,
 		FlowLabel:    0,
 		Length:       0,
-		NextHeader:   layers.IPProtocol(v4Header.Protocol),
-		HopLimit:     hopLimit,
+		NextHeader:   v4Header.Protocol,
+		HopLimit:     v4Header.TTL,
 		SrcIP:        v6Src,
 		DstIP:        v6Dst,
 		HopByHop:     nil,
@@ -68,6 +57,18 @@ func (g *Gateway) handleInboundPacket(bytes []byte) {
 	opts := gopacket.SerializeOptions{
 		FixLengths:       true,
 		ComputeChecksums: true,
+	}
+
+	for _, hook := range g.inboundHooks[uint8(v4Header.Protocol)] {
+		mutated, forward := hook(v6Header, data)
+		if !forward {
+			logger.Debug("Inbound hook dropped packet", zap.Any("header", v6Header))
+			return
+		}
+
+		if mutated != nil {
+			data = mutated
+		}
 	}
 
 	if err := gopacket.SerializeLayers(buf, opts, v6Header, gopacket.Payload(data)); err != nil {

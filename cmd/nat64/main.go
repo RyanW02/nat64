@@ -69,6 +69,7 @@ func main() {
 
 	// Start NAT64 gateway
 	gateway := nat64.NewGateway(opts, logger)
+
 	if opts.AutoConfigure {
 		if err := gateway.Configure(); err != nil {
 			logger.Fatal("Error configuring NAT64 gateway", zap.Error(err))

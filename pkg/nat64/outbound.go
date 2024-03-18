@@ -7,8 +7,6 @@ import (
 	"golang.org/x/net/ipv6"
 )
 
-type OutboundHook func(header *layers.IPv4, data []byte)
-
 func (g *Gateway) handleOutboundPacket(bytes []byte) {
 	logger := g.logger.With(zap.String("flow", "outbound"))
 
@@ -17,24 +15,19 @@ func (g *Gateway) handleOutboundPacket(bytes []byte) {
 		return
 	}
 
-	v6Header, err := ipv6.ParseHeader(bytes)
-	if err != nil {
-		logger.Warn("Error parsing IPv6 header", zap.Error(err), zap.Any("bytes", bytes))
+	packet := gopacket.NewPacket(bytes, layers.LayerTypeIPv6, gopacket.Default)
+	if packet.NetworkLayer() == nil || packet.NetworkLayer().LayerType() != layers.LayerTypeIPv6 {
+		logger.Warn("Packet does not contain an IPv6 layer")
 		return
 	}
 
-	data := bytes[ipv6.HeaderLen:]
+	v6Header := packet.NetworkLayer().(*layers.IPv6)
+	data := v6Header.LayerPayload()
 
-	v4Dst := v6Header.Dst[12:16]
-	v4Src := v6Header.Src[12:16]
+	v4Dst := v6Header.DstIP[12:16]
+	v4Src := v6Header.SrcIP[12:16]
 
-	var hopLimit uint8 = 255
-	if v6Header.HopLimit >= 0 && v6Header.HopLimit <= 255 {
-		hopLimit = uint8(v6Header.HopLimit)
-	}
-
-	if v6Header.NextHeader < 0 || v6Header.NextHeader > 255 {
-		logger.Warn("Invalid next header (protocol)", zap.Int("next_header", v6Header.NextHeader))
+	if v4Dst.IsPrivate() {
 		return
 	}
 
@@ -45,13 +38,13 @@ func (g *Gateway) handleOutboundPacket(bytes []byte) {
 		},
 		Version:    4,
 		IHL:        0,
-		TOS:        0,
+		TOS:        v6Header.TrafficClass,
 		Length:     0, // Computed upon serialization
 		Id:         0,
 		Flags:      layers.IPv4DontFragment,
 		FragOffset: 0,
-		TTL:        hopLimit,
-		Protocol:   layers.IPProtocol(v6Header.NextHeader),
+		TTL:        v6Header.HopLimit,
+		Protocol:   v6Header.NextHeader,
 		Checksum:   0, // Computed upon serialization
 		SrcIP:      v4Src,
 		DstIP:      v4Dst,
@@ -66,7 +59,15 @@ func (g *Gateway) handleOutboundPacket(bytes []byte) {
 	}
 
 	for _, hook := range g.outboundHooks[uint8(v4Header.Protocol)] {
-		hook(v4Header, data)
+		mutated, forward := hook(v4Header, data)
+		if !forward {
+			logger.Debug("Outbound hook dropped packet", zap.Any("header", v6Header))
+			return
+		}
+
+		if mutated != nil {
+			data = mutated
+		}
 	}
 
 	if err := gopacket.SerializeLayers(buf, opts, v4Header, gopacket.Payload(data)); err != nil {
@@ -81,8 +82,8 @@ func (g *Gateway) handleOutboundPacket(bytes []byte) {
 
 	logger.Debug(
 		"Packet sent to TUN interface",
-		zap.String("v6_src", v6Header.Src.String()),
-		zap.String("v6_dst", v6Header.Dst.String()),
+		zap.String("v6_src", v6Header.SrcIP.String()),
+		zap.String("v6_dst", v6Header.DstIP.String()),
 		zap.String("v4_src", v4Src.String()),
 		zap.String("v4_dst", v4Dst.String()),
 	)
