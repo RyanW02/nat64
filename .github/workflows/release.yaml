@@ -34,7 +34,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          upload_url: ${{ steps.get_url.outputs.upload_url }}
+          upload_url: ${{ github.event.release.upload_url }}
           asset_path: nat64
           asset_name: nat64-${{ matrix.os }}-${{ matrix.gooarch }}
           asset_content_type: application/octet-stream
